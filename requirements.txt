@@ -1,0 +1,16 @@
+azureml-core
+azureml-train-core
+azureml-dataset-runtime[fuse,pandas]
+azure-identity
+azure-keyvault-secrets
+pandas
+numpy
+scikit-learn==1.0.2
+matplotlib
+seaborn
+joblib
+mlflow
+pytest
+python-dotenv
+pyyaml
+requests
