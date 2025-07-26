@@ -64,5 +64,25 @@ jobs:
           AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
           AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
 
+      - name: Submit Model Training Job
+        id: train
+        run : | 
+          python azure_ml/train_job.py \
+          --experiment-name "model-training-$(date +%Y%m%d)" \
+          --compute-name cpu-cluster \
+          --vm-size STANDARD_DS3_V2 \
+          --model-type random_forest \
+          --model-name ${{ env.MODEL_NAME }} \
+          --wait-for-completion
+          
+          # Extract model version from training output
+          MODEL_VERSION=$(date +%Y%m%d%H%M%S)
+          echo "model-version=$MODEL_VERSION" >> $GITHUB_OUTPUT
+
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
+
 
     
