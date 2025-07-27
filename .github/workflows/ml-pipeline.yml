@@ -5,17 +5,23 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main ]
-  # workflow_dispatch:
-  #   inputs:
-  #     deploy_to_production:
-  #       description: 'Deploy to production'
-  #       required: false
-  #       default: false
-  #       type: boolean
+  workflow_dispatch:
+    inputs:
+      deploy_to_production:
+        description: 'Deploy to production'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  MODEL_NAME: trained-model  # Changed to use dashes instead of underscores
 
 jobs:
-  data-validation: 
-    runs-on : ubuntu-latest
+  data-validation:
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     
@@ -36,57 +42,306 @@ jobs:
 
   model-training:
     needs: data-validation
-    runs-on : ubuntu-latest
+    runs-on: ubuntu-latest
     outputs:
-        model-version: ${{ steps.train.outputs.model-version }}
-
-    steps: 
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.8'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          auth-type: SERVICE_PRINCIPAL
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Set up Azure ML workspace
-        run: |
-          python scripts/create_workspace_config.py
-        env:
-          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
-          AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
-
-      - name: Submit Model Training Job
-        id: train
-        run : | 
-          python azure_ml/train_job.py \
+      model-version: ${{ steps.train.outputs.model-version }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.8'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Set up Azure ML workspace
+      run: |
+        python scripts/create_workspace_config.py
+      env:
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+        AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
+    
+    - name: Validate Azure ML workspace config
+      run: |
+        python scripts/validate_workspace_config.py
+        echo "Config file contents:"
+        cat .azureml/config.json
+    
+    - name: Clean up existing endpoints before training
+      run: |
+        cd deployment
+        python deploy_managed_endpoint.py --action cleanup
+        echo "Waiting 30 seconds for quota to be freed..."
+        sleep 30
+      continue-on-error: true
+    
+    - name: Submit Azure ML Training Job
+      id: train
+      run: |
+        python azure_ml/train_job.py \
           --experiment-name "model-training-$(date +%Y%m%d)" \
           --compute-name cpu-cluster \
-          --vm-size STANDARD_DS3_V2 \
+          --vm-size STANDARD_DS2_V2 \
           --model-type random_forest \
           --model-name ${{ env.MODEL_NAME }} \
           --wait-for-completion
-          
-          # Extract model version from training output
-          MODEL_VERSION=$(date +%Y%m%d%H%M%S)
-          echo "model-version=$MODEL_VERSION" >> $GITHUB_OUTPUT
-
-        env:
-          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
-          AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
-
-
+        
+        # Extract model version from training output
+        MODEL_VERSION=$(date +%Y%m%d%H%M%S)
+        echo "model-version=$MODEL_VERSION" >> $GITHUB_OUTPUT
+      env:
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+        AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
     
+    - name: Verify model registration in Azure ML
+      run: |
+        echo "=== Verifying model registration ==="
+        python -c "
+        from azure.ai.ml import MLClient
+        from azure.identity import DefaultAzureCredential
+        import json
+        
+        config_path = '.azureml/config.json'
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        ml_client = MLClient(
+            credential=DefaultAzureCredential(),
+            subscription_id=config['subscription_id'],
+            resource_group_name=config['resource_group'],
+            workspace_name=config['workspace_name']
+        )
+        
+        model_name = '${{ env.MODEL_NAME }}'
+        try:
+            model = ml_client.models.get(name=model_name, label='latest')
+            print(f'✅ Model {model_name} found in registry')
+            print(f'   Version: {model.version}')
+            print(f'   ID: {model.id}')
+        except Exception as e:
+            print(f'❌ Model {model_name} not found: {e}')
+            exit(1)
+        "
+      continue-on-error: false
+    
+
+  model-deployment-staging:
+    needs: model-training
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'pull_request'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.8'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Note about model location
+      run: |
+        echo "ℹ️ Model will be loaded from Azure ML Model Registry"
+        echo "   No local artifacts needed - using latest registered model"
+    
+    - name: Set up Azure ML workspace
+      run: |
+        python scripts/create_workspace_config.py
+      env:
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+        AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
+    
+    - name: Deploy to staging using Managed Endpoints
+      run: |
+        cd deployment
+        python deploy_managed_endpoint.py \
+          --action deploy \
+          --model-name ${{ env.MODEL_NAME }} \
+          --endpoint-name "${{ env.MODEL_NAME }}-staging" \
+          --config-file deployment_config_production.yml
+      env:
+        MODEL_NAME: ${{ env.MODEL_NAME }}
+        DEPLOYMENT_ENV: staging
+    
+    - name: Run integration tests
+      run: |
+        python -m pytest tests/test_integration.py -v
+      continue-on-error: false
+
+  model-deployment-production:
+    needs: model-training
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event.inputs.deploy_to_production == 'true')
+    environment: production
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.8'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Note about model location  
+      run: |
+        echo "ℹ️ Model will be loaded from Azure ML Model Registry"
+        echo "   No local artifacts needed - using latest registered model"
+    
+    - name: Set up Azure ML workspace
+      run: |
+        python scripts/create_workspace_config.py
+      env:
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+        AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
+    
+    - name: Clean up old production endpoints
+      run: |
+        cd deployment
+        python deploy_managed_endpoint.py --action list
+        
+        # Cleanup is handled automatically by the managed endpoint deployment script
+        echo "Endpoint cleanup will be handled during deployment"
+      continue-on-error: true
+      
+    
+    - name: Check quota and optimize instance selection
+      run: |
+        cd deployment
+        python check_quota_and_instances.py
+        echo "Quota analysis completed - optimal instance type selected"
+      continue-on-error: true
+    
+    - name: Deploy to production using Managed Endpoints
+      run: |
+        cd deployment
+        python deploy_managed_endpoint.py \
+          --action deploy \
+          --model-name ${{ env.MODEL_NAME }} \
+          --endpoint-name "${{ env.MODEL_NAME }}-production" \
+          --config-file deployment_config_production.yml
+      env:
+        MODEL_NAME: ${{ env.MODEL_NAME }}
+        DEPLOYMENT_ENV: production
+    
+    - name: Verify production managed endpoint
+      run: |
+        cd deployment
+        python deploy_managed_endpoint.py --action list
+        
+        # Verify production endpoint exists and is healthy
+        python -c "
+        from azure.ai.ml import MLClient
+        from azure.identity import DefaultAzureCredential
+        import json
+        import os
+        
+        # Create ML client
+        config_path = '../.azureml/config.json'
+        if not os.path.exists(config_path):
+            config_path = '.azureml/config.json'
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        ml_client = MLClient(
+            credential=DefaultAzureCredential(),
+            subscription_id=config['subscription_id'],
+            resource_group_name=config['resource_group'],
+            workspace_name=config['workspace_name']
+        )
+        
+        endpoint_name = '${{ env.MODEL_NAME }}-production'
+        
+        try:
+            endpoint = ml_client.online_endpoints.get(name=endpoint_name)
+            print(f'✅ Production endpoint verified: {endpoint.name}')
+            print(f'   Scoring URI: {endpoint.scoring_uri}')
+            print(f'   Traffic allocation: {endpoint.traffic}')
+        except Exception as e:
+            raise Exception(f'Production endpoint {endpoint_name} not found or unhealthy: {e}')
+        "
+    
+    - name: Run smoke tests
+      run: |
+        python -m pytest tests/test_smoke.py -v
+      continue-on-error: false
+    
+    - name: Notify deployment success
+      if: success()
+      run: |
+        echo "✅ Model ${{ env.MODEL_NAME }} v${{ needs.model-training.outputs.model-version }} deployed to production successfully"
+        echo "🚀 Single production endpoint is active and healthy"
+
+  cleanup:
+    needs: [model-deployment-staging, model-deployment-production]
+    runs-on: ubuntu-latest
+    if: always() && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.8'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Set up Azure ML workspace
+      run: |
+        python scripts/create_workspace_config.py
+      env:
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+        AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
+    
+    - name: Cleanup old endpoints and services  
+      run: |
+        cd deployment
+        echo "🧹 Running final cleanup..."
+        
+        # Use the dedicated cleanup script which handles this properly
+        python deploy_managed_endpoint.py --action cleanup || echo "Cleanup completed with warnings"
+        
+        echo "✅ Cleanup completed - only production endpoint should remain"
+      continue-on-error: true

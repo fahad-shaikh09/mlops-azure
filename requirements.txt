@@ -1,6 +1,7 @@
 azureml-core
 azureml-train-core
 azureml-dataset-runtime[fuse,pandas]
+azure-ai-ml>=1.11.0
 azure-identity
 azure-keyvault-secrets
 pandas
